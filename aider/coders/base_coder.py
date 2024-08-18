@@ -1352,7 +1352,6 @@ class Coder:
                 self.temperature,
                 extra_headers=model.extra_headers,
                 max_tokens=model.max_tokens,
-                api_key=self.api_key,
                 base_url=self.base_url
             )
             self.chat_completion_call_hashes.append(hash_object.hexdigest())
