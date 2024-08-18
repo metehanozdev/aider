@@ -8,10 +8,9 @@ from aider.models import Model
 OPENAI_API_KEY = ''
 BASE_URL = 'https://api.openai.com/v1'
 BASE_MODEL = 'gpt-4o'
-task = '''Refactor Login.js to use local state
-Remove the import of useLoginContext and useRegisterContext. - Replace the usage of loginData, setLoginData, loginPending, setLoginPending, loggedIn, setLoggedIn, loginFailMessage, and setLoginFailMessage with local state variables. - Update the handleChange and handleSubmit functions to use the local state variables.'''
-files=['/Users/metehanoz/FumeData/metehanozdev-ecohabit-main/client/src/components/Login.js']
-task_id = 'metehanozdev-ecohabit-main'
+task = '''Modify the Settings.js component to render the list of studios and add a delete button next to each studio.'''
+files=['/Users/metehanoz/FumeData/a1723821574-fume-metehanozmtf-27f9cb8b/fume-auth/src/pages/Settings.js']
+task_id = 'a1723821574-fume-metehanozmtf-27f9cb8b'
 
 
 model = Model(model=BASE_MODEL)
