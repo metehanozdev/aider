@@ -2,9 +2,11 @@ import hashlib
 import json
 
 import backoff
+import httpx
+import openai
 
 from aider.dump import dump  # noqa: F401
-from aider.llm import litellm
+from aider.litellm import litellm
 
 # from diskcache import Cache
 
@@ -14,10 +16,23 @@ CACHE = None
 # CACHE = Cache(CACHE_PATH)
 
 
-def retry_exceptions():
-    import httpx
+def should_giveup(e):
+    if not hasattr(e, "status_code"):
+        return False
 
-    return (
+    if type(e) in (
+        httpx.ConnectError,
+        httpx.RemoteProtocolError,
+        httpx.ReadTimeout,
+    ):
+        return False
+
+    return not litellm._should_retry(e.status_code)
+
+
+@backoff.on_exception(
+    backoff.expo,
+    (
         httpx.ConnectError,
         httpx.RemoteProtocolError,
         httpx.ReadTimeout,
@@ -26,31 +41,14 @@ def retry_exceptions():
         litellm.exceptions.RateLimitError,
         litellm.exceptions.ServiceUnavailableError,
         litellm.exceptions.Timeout,
-        litellm.exceptions.InternalServerError,
-        litellm.llms.anthropic.AnthropicError,
-    )
-
-
-def lazy_litellm_retry_decorator(func):
-    def wrapper(*args, **kwargs):
-        decorated_func = backoff.on_exception(
-            backoff.expo,
-            retry_exceptions(),
-            max_time=60,
-            on_backoff=lambda details: print(
-                f"{details.get('exception', 'Exception')}\nRetry in {details['wait']:.1f} seconds."
-            ),
-        )(func)
-        return decorated_func(*args, **kwargs)
-
-    return wrapper
-
-
-def send_completion(
-    model_name, messages, functions, stream, temperature=0, extra_headers=None, max_tokens=None , base_url=None
-):
-    from aider.llm import litellm
-
+    ),
+    giveup=should_giveup,
+    max_time=60,
+    on_backoff=lambda details: print(
+        f"{details.get('exception','Exception')}\nRetry in {details['wait']:.1f} seconds."
+    ),
+)
+def send_with_retries(model_name, messages, functions, stream, temperature=0, api_key=None, base_url=None):
     kwargs = dict(
         model=model_name,
         messages=messages,
@@ -58,15 +56,8 @@ def send_completion(
         stream=stream,
         base_url=base_url,
     )
-
     if functions is not None:
-        function = functions[0]
-        kwargs["tools"] = [dict(type="function", function=function)]
-        kwargs["tool_choice"] = {"type": "function", "function": {"name": function["name"]}}
-    if extra_headers is not None:
-        kwargs["extra_headers"] = extra_headers
-    if max_tokens is not None:
-        kwargs["max_tokens"] = max_tokens
+        kwargs["functions"] = functions
 
     key = json.dumps(kwargs, sort_keys=True).encode()
 
@@ -86,15 +77,14 @@ def send_completion(
     return hash_object, res
 
 
-@lazy_litellm_retry_decorator
 def simple_send_with_retries(model_name, messages):
     try:
-        _hash, response = send_completion(
+        _hash, response = send_with_retries(
             model_name=model_name,
             messages=messages,
             functions=None,
             stream=False,
         )
         return response.choices[0].message.content
-    except (AttributeError, litellm.exceptions.BadRequestError):
+    except (AttributeError, openai.BadRequestError):
         return

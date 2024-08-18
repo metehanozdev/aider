@@ -1,6 +1,6 @@
-from pathlib import Path
 
 from aider import diffs
+from pathlib import Path
 
 from ..dump import dump  # noqa: F401
 from .base_coder import Coder
@@ -8,9 +8,11 @@ from .wholefile_prompts import WholeFilePrompts
 
 
 class WholeFileCoder(Coder):
-    """A coder that operates on entire files for code modifications."""
     edit_format = "whole"
-    gpt_prompts = WholeFilePrompts()
+
+    def __init__(self, *args, **kwargs):
+        self.gpt_prompts = WholeFilePrompts()
+        super().__init__(*args, **kwargs)
 
     def update_cur_messages(self, edited):
         if edited:
@@ -24,10 +26,10 @@ class WholeFileCoder(Coder):
         try:
             return self.get_edits(mode="diff")
         except ValueError:
-            return self.get_multi_response_content()
+            return self.partial_response_content
 
     def get_edits(self, mode="update"):
-        content = self.get_multi_response_content()
+        content = self.partial_response_content
 
         chat_files = self.get_inchat_relative_files()
 

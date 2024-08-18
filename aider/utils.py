@@ -1,9 +1,5 @@
-import itertools
 import os
-import subprocess
-import sys
 import tempfile
-import time
 from pathlib import Path
 
 import git
@@ -21,16 +17,10 @@ class IgnorantTemporaryDirectory:
         return self.temp_dir.__enter__()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.cleanup()
-
-    def cleanup(self):
         try:
-            self.temp_dir.cleanup()
+            self.temp_dir.__exit__(exc_type, exc_val, exc_tb)
         except (OSError, PermissionError):
             pass  # Ignore errors (Windows)
-
-    def __getattr__(self, item):
-        return getattr(self.temp_dir, item)
 
 
 class ChdirTemporaryDirectory(IgnorantTemporaryDirectory):
@@ -44,7 +34,7 @@ class ChdirTemporaryDirectory(IgnorantTemporaryDirectory):
 
     def __enter__(self):
         res = super().__enter__()
-        os.chdir(Path(self.temp_dir.name).resolve())
+        os.chdir(self.temp_dir.name)
         return res
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -94,44 +84,24 @@ def safe_abs_path(res):
     return str(res)
 
 
-def format_content(role, content):
-    formatted_lines = []
-    for line in content.splitlines():
-        formatted_lines.append(f"{role} {line}")
-    return "\n".join(formatted_lines)
-
-
-def format_messages(messages, title=None):
-    output = []
+def show_messages(messages, title=None, functions=None):
     if title:
-        output.append(f"{title.upper()} {'*' * 50}")
+        print(title.upper(), "*" * 50)
 
     for msg in messages:
-        output.append("")
+        print()
         role = msg["role"].upper()
         content = msg.get("content")
         if isinstance(content, list):  # Handle list content (e.g., image messages)
             for item in content:
-                if isinstance(item, dict):
-                    for key, value in item.items():
-                        if isinstance(value, dict) and "url" in value:
-                            output.append(f"{role} {key.capitalize()} URL: {value['url']}")
-                        else:
-                            output.append(f"{role} {key}: {value}")
-                else:
-                    output.append(f"{role} {item}")
+                if isinstance(item, dict) and "image_url" in item:
+                    print(role, "Image URL:", item["image_url"]["url"])
         elif isinstance(content, str):  # Handle string content
-            output.append(format_content(role, content))
-        function_call = msg.get("function_call")
-        if function_call:
-            output.append(f"{role} Function Call: {function_call}")
-
-    return "\n".join(output)
-
-
-def show_messages(messages, title=None, functions=None):
-    formatted_output = format_messages(messages, title)
-    print(formatted_output)
+            for line in content.splitlines():
+                print(role, line)
+        content = msg.get("function_call")
+        if content:
+            print(role, content)
 
     if functions:
         dump(functions)
@@ -186,114 +156,3 @@ def split_chat_history_markdown(text, include_tool=False):
         messages = [m for m in messages if m["role"] != "tool"]
 
     return messages
-
-
-def get_pip_install(args):
-    cmd = [
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-    ]
-    cmd += args
-    return cmd
-
-
-def run_install(cmd):
-    print()
-    print("Installing: ", " ".join(cmd))
-
-    try:
-        output = []
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True,
-        )
-        spinner = Spinner("Installing...")
-
-        while True:
-            char = process.stdout.read(1)
-            if not char:
-                break
-
-            output.append(char)
-            spinner.step()
-
-        spinner.end()
-        return_code = process.wait()
-        output = "".join(output)
-
-        if return_code == 0:
-            print("Installation complete.")
-            print()
-            return True, output
-
-    except subprocess.CalledProcessError as e:
-        print(f"\nError running pip install: {e}")
-
-    print("\nInstallation failed.\n")
-
-    return False, output
-
-
-class Spinner:
-    spinner_chars = itertools.cycle(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
-
-    def __init__(self, text):
-        self.text = text
-        self.start_time = time.time()
-        self.last_update = 0
-        self.visible = False
-
-    def step(self):
-        current_time = time.time()
-        if not self.visible and current_time - self.start_time >= 0.5:
-            self.visible = True
-            self._step()
-        elif self.visible and current_time - self.last_update >= 0.1:
-            self._step()
-        self.last_update = current_time
-
-    def _step(self):
-        if not self.visible:
-            return
-
-        print(f"\r{self.text} {next(self.spinner_chars)}\r{self.text} ", end="", flush=True)
-
-    def end(self):
-        if self.visible:
-            print("\r" + " " * (len(self.text) + 3))
-
-
-def check_pip_install_extra(io, module, prompt, pip_install_cmd):
-    try:
-        __import__(module)
-        return True
-    except (ImportError, ModuleNotFoundError):
-        pass
-
-    cmd = get_pip_install(pip_install_cmd)
-
-    text = f"{prompt}:\n\n{' '.join(cmd)}\n"
-    io.tool_error(text)
-
-    if not io.confirm_ask("Run pip install?", default="y"):
-        return
-
-    success, output = run_install(cmd)
-    if success:
-        try:
-            __import__(module)
-            return True
-        except (ImportError, ModuleNotFoundError) as err:
-            io.tool_error(str(err))
-            pass
-
-    io.tool_error(output)
-
-    print()
-    print(f"Failed to install {pip_install_cmd[0]}")

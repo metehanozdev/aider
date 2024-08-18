@@ -6,12 +6,10 @@ from aider.sendchat import simple_send_with_retries
 
 
 class ChatSummary:
-    def __init__(self, models=None, max_tokens=1024):
-        if not models:
-            raise ValueError("At least one model must be provided")
-        self.models = models if isinstance(models, list) else [models]
+    def __init__(self, model=None, max_tokens=1024):
+        self.token_count = model.token_count
         self.max_tokens = max_tokens
-        self.token_count = self.models[0].token_count
+        self.model = model
 
     def too_big(self, messages):
         sized = self.tokenize(messages)
@@ -26,9 +24,6 @@ class ChatSummary:
         return sized
 
     def summarize(self, messages, depth=0):
-        if not self.models:
-            raise ValueError("No models available for summarization")
-
         sized = self.tokenize(messages)
         total = sum(tokens for tokens, _msg in sized)
         if total <= self.max_tokens and depth == 0:
@@ -66,11 +61,7 @@ class ChatSummary:
         sized.reverse()
         keep = []
         total = 0
-
-        # These sometimes come set with value = None
-        model_max_input_tokens = self.models[0].info.get("max_input_tokens") or 4096
-        model_max_input_tokens -= 512
-
+        model_max_input_tokens = self.model.info.get("max_input_tokens", 4096) - 512
         for i in range(split_index):
             total += sized[i][0]
             if total > model_max_input_tokens:
@@ -101,21 +92,17 @@ class ChatSummary:
             if not content.endswith("\n"):
                 content += "\n"
 
-        summarize_messages = [
+        messages = [
             dict(role="system", content=prompts.summarize),
             dict(role="user", content=content),
         ]
 
-        for model in self.models:
-            try:
-                summary = simple_send_with_retries(model.name, summarize_messages)
-                if summary is not None:
-                    summary = prompts.summary_prefix + summary
-                    return [dict(role="user", content=summary)]
-            except Exception as e:
-                print(f"Summarization failed for model {model.name}: {str(e)}")
+        summary = simple_send_with_retries(self.model.name, messages)
+        if summary is None:
+            raise ValueError(f"summarizer unexpectedly failed for {self.model.name}")
+        summary = prompts.summary_prefix + summary
 
-        raise ValueError("summarizer unexpectedly failed for all models")
+        return [dict(role="user", content=summary)]
 
 
 def main():
@@ -123,9 +110,8 @@ def main():
     parser.add_argument("filename", help="Markdown file to parse")
     args = parser.parse_args()
 
-    model_names = ["gpt-3.5-turbo", "gpt-4"]  # Add more model names as needed
-    model_list = [models.Model(name) for name in model_names]
-    summarizer = ChatSummary(model_list)
+    model = models.Model("gpt-3.5-turbo")
+    summarizer = ChatSummary(model)
 
     with open(args.filename, "r") as f:
         text = f.read()
