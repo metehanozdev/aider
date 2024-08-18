@@ -1,4 +1,5 @@
 import os
+import time
 from pathlib import Path, PurePosixPath
 
 import git
@@ -15,10 +16,37 @@ class GitRepo:
     aider_ignore_file = None
     aider_ignore_spec = None
     aider_ignore_ts = 0
+    aider_ignore_last_check = 0
+    subtree_only = False
+    ignore_file_cache = {}
 
-    def __init__(self, io, fnames, git_dname, aider_ignore_file=None, models=None):
+    def __init__(
+        self,
+        io,
+        fnames,
+        git_dname,
+        aider_ignore_file=None,
+        models=None,
+        attribute_author=True,
+        attribute_committer=True,
+        attribute_commit_message_author=False,
+        attribute_commit_message_committer=False,
+        commit_prompt=None,
+        subtree_only=False,
+    ):
         self.io = io
         self.models = models
+
+        self.normalized_path = {}
+        self.tree_files = {}
+
+        self.attribute_author = attribute_author
+        self.attribute_committer = attribute_committer
+        self.attribute_commit_message_author = attribute_commit_message_author
+        self.attribute_commit_message_committer = attribute_commit_message_committer
+        self.commit_prompt = commit_prompt
+        self.subtree_only = subtree_only
+        self.ignore_file_cache = {}
 
         if git_dname:
             check_fnames = [git_dname]
@@ -59,7 +87,7 @@ class GitRepo:
         if aider_ignore_file:
             self.aider_ignore_file = Path(aider_ignore_file)
 
-    def commit(self, fnames=None, context=None, prefix=None, message=None):
+    def commit(self, fnames=None, context=None, message=None, aider_edits=False):
         if not fnames and not self.repo.is_dirty():
             return
 
@@ -72,15 +100,17 @@ class GitRepo:
         else:
             commit_message = self.get_commit_message(diffs, context)
 
+        if aider_edits and self.attribute_commit_message_author:
+            commit_message = "aider: " + commit_message
+        elif self.attribute_commit_message_committer:
+            commit_message = "aider: " + commit_message
+
         if not commit_message:
             commit_message = "(no commit message provided)"
 
-        if prefix:
-            commit_message = prefix + commit_message
-
         full_commit_message = commit_message
-        if context:
-            full_commit_message += "\n\n# Aider chat conversation:\n\n" + context
+        # if context:
+        #    full_commit_message += "\n\n# Aider chat conversation:\n\n" + context
 
         cmd = ["-m", full_commit_message, "--no-verify"]
         if fnames:
@@ -91,9 +121,34 @@ class GitRepo:
         else:
             cmd += ["-a"]
 
+        original_user_name = self.repo.config_reader().get_value("user", "name")
+        original_committer_name_env = os.environ.get("GIT_COMMITTER_NAME")
+        committer_name = f"{original_user_name} (aider)"
+
+        if self.attribute_committer:
+            os.environ["GIT_COMMITTER_NAME"] = committer_name
+
+        if aider_edits and self.attribute_author:
+            original_auther_name_env = os.environ.get("GIT_AUTHOR_NAME")
+            os.environ["GIT_AUTHOR_NAME"] = committer_name
+
         self.repo.git.commit(cmd)
         commit_hash = self.repo.head.commit.hexsha[:7]
-        self.io.tool_output(f"Commit {commit_hash} {commit_message}")
+        self.io.tool_output(f"Commit {commit_hash} {commit_message}", bold=True)
+
+        # Restore the env
+
+        if self.attribute_committer:
+            if original_committer_name_env is not None:
+                os.environ["GIT_COMMITTER_NAME"] = original_committer_name_env
+            else:
+                del os.environ["GIT_COMMITTER_NAME"]
+
+        if aider_edits and self.attribute_author:
+            if original_auther_name_env is not None:
+                os.environ["GIT_AUTHOR_NAME"] = original_auther_name_env
+            else:
+                del os.environ["GIT_AUTHOR_NAME"]
 
         return commit_hash, commit_message
 
@@ -104,10 +159,6 @@ class GitRepo:
             return self.repo.git_dir
 
     def get_commit_message(self, diffs, context):
-        if len(diffs) >= 4 * 1024 * 4:
-            self.io.tool_error("Diff is too large to generate a commit message.")
-            return
-
         diffs = "# Diffs:\n" + diffs
 
         content = ""
@@ -115,12 +166,18 @@ class GitRepo:
             content += context + "\n"
         content += diffs
 
+        system_content = self.commit_prompt or prompts.commit_system
         messages = [
-            dict(role="system", content=prompts.commit_system),
+            dict(role="system", content=system_content),
             dict(role="user", content=content),
         ]
 
+        commit_message = None
         for model in self.models:
+            num_tokens = model.token_count(messages)
+            max_tokens = model.info.get("max_input_tokens") or 0
+            if max_tokens and num_tokens > max_tokens:
+                continue
             commit_message = simple_send_with_retries(model.name, messages)
             if commit_message:
                 break
@@ -174,6 +231,8 @@ class GitRepo:
         args = []
         if pretty:
             args += ["--color"]
+        else:
+            args += ["--color=never"]
 
         args += [from_commit, to_commit]
         diffs = self.repo.git.diff(*args)
@@ -189,45 +248,84 @@ class GitRepo:
         except ValueError:
             commit = None
 
-        files = []
+        files = set()
         if commit:
-            for blob in commit.tree.traverse():
-                if blob.type == "blob":  # blob is a file
-                    files.append(blob.path)
+            if commit in self.tree_files:
+                files = self.tree_files[commit]
+            else:
+                for blob in commit.tree.traverse():
+                    if blob.type == "blob":  # blob is a file
+                        files.add(blob.path)
+                files = set(self.normalize_path(path) for path in files)
+                self.tree_files[commit] = set(files)
 
         # Add staged files
         index = self.repo.index
         staged_files = [path for path, _ in index.entries.keys()]
+        files.update(self.normalize_path(path) for path in staged_files)
 
-        files.extend(staged_files)
-
-        # convert to appropriate os.sep, since git always normalizes to /
-        res = set(self.normalize_path(path) for path in files)
-
-        res = [fname for fname in res if not self.ignored_file(fname)]
+        res = [fname for fname in files if not self.ignored_file(fname)]
 
         return res
 
     def normalize_path(self, path):
-        return str(Path(PurePosixPath((Path(self.root) / path).relative_to(self.root))))
+        orig_path = path
+        res = self.normalized_path.get(orig_path)
+        if res:
+            return res
 
-    def ignored_file(self, fname):
-        if not self.aider_ignore_file or not self.aider_ignore_file.is_file():
+        path = str(Path(PurePosixPath((Path(self.root) / path).relative_to(self.root))))
+        self.normalized_path[orig_path] = path
+        return path
+
+    def refresh_aider_ignore(self):
+        if not self.aider_ignore_file:
             return
 
-        try:
-            fname = self.normalize_path(fname)
-        except ValueError:
+        current_time = time.time()
+        if current_time - self.aider_ignore_last_check < 1:
+            return
+
+        self.aider_ignore_last_check = current_time
+
+        if not self.aider_ignore_file.is_file():
             return
 
         mtime = self.aider_ignore_file.stat().st_mtime
         if mtime != self.aider_ignore_ts:
             self.aider_ignore_ts = mtime
+            self.ignore_file_cache = {}
             lines = self.aider_ignore_file.read_text().splitlines()
             self.aider_ignore_spec = pathspec.PathSpec.from_lines(
                 pathspec.patterns.GitWildMatchPattern,
                 lines,
             )
+
+    def ignored_file(self, fname):
+        self.refresh_aider_ignore()
+
+        if fname in self.ignore_file_cache:
+            return self.ignore_file_cache[fname]
+
+        result = self.ignored_file_raw(fname)
+        self.ignore_file_cache[fname] = result
+        return result
+
+    def ignored_file_raw(self, fname):
+        if self.subtree_only:
+            fname_path = Path(self.normalize_path(fname))
+            cwd_path = Path.cwd().resolve().relative_to(Path(self.root).resolve())
+
+            if cwd_path not in fname_path.parents and fname_path != cwd_path:
+                return True
+
+        if not self.aider_ignore_file or not self.aider_ignore_file.is_file():
+            return False
+
+        try:
+            fname = self.normalize_path(fname)
+        except ValueError:
+            return True
 
         return self.aider_ignore_spec.match_file(fname)
 
@@ -264,3 +362,9 @@ class GitRepo:
             return True
 
         return self.repo.is_dirty(path=path)
+
+    def get_head(self):
+        try:
+            return self.repo.head.commit.hexsha
+        except ValueError:
+            return None

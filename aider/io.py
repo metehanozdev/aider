@@ -15,6 +15,7 @@ from pygments.lexers import MarkdownLexer, guess_lexer_for_filename
 from pygments.token import Token
 from pygments.util import ClassNotFound
 from rich.console import Console
+from rich.style import Style as RichStyle
 from rich.text import Text
 
 from .dump import dump  # noqa: F401
@@ -22,11 +23,13 @@ from .utils import is_image_file
 
 
 class AutoCompleter(Completer):
-    def __init__(self, root, rel_fnames, addable_rel_fnames, commands, encoding):
-        self.commands = commands
+    def __init__(
+        self, root, rel_fnames, addable_rel_fnames, commands, encoding, abs_read_only_fnames=None
+    ):
         self.addable_rel_fnames = addable_rel_fnames
         self.rel_fnames = rel_fnames
         self.encoding = encoding
+        self.abs_read_only_fnames = abs_read_only_fnames or []
 
         fname_to_rel_fnames = defaultdict(list)
         for rel_fname in addable_rel_fnames:
@@ -37,13 +40,22 @@ class AutoCompleter(Completer):
 
         self.words = set()
 
+        self.commands = commands
+        self.command_completions = dict()
+        if commands:
+            self.command_names = self.commands.get_commands()
+
         for rel_fname in addable_rel_fnames:
             self.words.add(rel_fname)
 
         for rel_fname in rel_fnames:
             self.words.add(rel_fname)
 
-            fname = Path(root) / rel_fname
+        all_fnames = [Path(root) / rel_fname for rel_fname in rel_fnames]
+        if abs_read_only_fnames:
+            all_fnames.extend(abs_read_only_fnames)
+
+        for fname in all_fnames:
             try:
                 with open(fname, "r", encoding=self.encoding) as f:
                     content = f.read()
@@ -56,6 +68,36 @@ class AutoCompleter(Completer):
             tokens = list(lexer.get_tokens(content))
             self.words.update(token[1] for token in tokens if token[0] in Token.Name)
 
+    def get_command_completions(self, text, words):
+        candidates = []
+        if len(words) == 1 and not text[-1].isspace():
+            partial = words[0].lower()
+            candidates = [cmd for cmd in self.command_names if cmd.startswith(partial)]
+            return candidates
+
+        if len(words) <= 1:
+            return []
+        if text[-1].isspace():
+            return []
+
+        cmd = words[0]
+        partial = words[-1].lower()
+
+        if cmd not in self.command_names:
+            return
+
+        if cmd not in self.command_completions:
+            candidates = self.commands.get_completions(cmd)
+            self.command_completions[cmd] = candidates
+        else:
+            candidates = self.command_completions[cmd]
+
+        if candidates is None:
+            return
+
+        candidates = [word for word in candidates if partial in word.lower()]
+        return candidates
+
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
         words = text.split()
@@ -63,17 +105,15 @@ class AutoCompleter(Completer):
             return
 
         if text[0] == "/":
-            if len(words) == 1 and not text[-1].isspace():
-                candidates = self.commands.get_commands()
-                candidates = [(cmd, cmd) for cmd in candidates]
-            else:
-                for completion in self.commands.get_command_completions(words[0][1:], words[-1]):
-                    yield completion
+            candidates = self.get_command_completions(text, words)
+            if candidates is not None:
+                for candidate in candidates:
+                    yield Completion(candidate, start_position=-len(words[-1]))
                 return
-        else:
-            candidates = self.words
-            candidates.update(set(self.fname_to_rel_fnames))
-            candidates = [(word, f"`{word}`") for word in candidates]
+
+        candidates = self.words
+        candidates.update(set(self.fname_to_rel_fnames))
+        candidates = [(word, f"`{word}`") for word in candidates]
 
         last_word = words[-1]
         for word_match, word_insert in candidates:
@@ -107,6 +147,7 @@ class InputOutput:
         tool_error_color="red",
         encoding="utf-8",
         dry_run=False,
+        llm_history_file=None,
         editingmode=EditingMode.EMACS,
     ):
         self.editingmode = editingmode
@@ -128,6 +169,7 @@ class InputOutput:
         self.yes = yes
 
         self.input_history_file = input_history_file
+        self.llm_history_file = llm_history_file
         if chat_history_file is not None:
             self.chat_history_file = Path(chat_history_file)
         else:
@@ -183,7 +225,7 @@ class InputOutput:
         with open(str(filename), "w", encoding=self.encoding) as f:
             f.write(content)
 
-    def get_input(self, root, rel_fnames, addable_rel_fnames, commands):
+    def get_input(self, root, rel_fnames, addable_rel_fnames, commands, abs_read_only_fnames=None):
         if self.pretty:
             style = dict(style=self.user_input_color) if self.user_input_color else dict()
             self.console.rule(**style)
@@ -209,10 +251,16 @@ class InputOutput:
         else:
             style = None
 
+        completer_instance = AutoCompleter(
+            root,
+            rel_fnames,
+            addable_rel_fnames,
+            commands,
+            self.encoding,
+            abs_read_only_fnames=abs_read_only_fnames,
+        )
+
         while True:
-            completer_instance = AutoCompleter(
-                root, rel_fnames, addable_rel_fnames, commands, self.encoding
-            )
             if multiline_input:
                 show = ". "
 
@@ -271,10 +319,18 @@ class InputOutput:
         fh = FileHistory(self.input_history_file)
         return fh.load_history_strings()
 
+    def log_llm_history(self, role, content):
+        if not self.llm_history_file:
+            return
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        with open(self.llm_history_file, "a", encoding=self.encoding) as log_file:
+            log_file.write(f"{role.upper()} {timestamp}\n")
+            log_file.write(content + "\n")
+
     def user_input(self, inp, log_only=True):
         if not log_only:
             style = dict(style=self.user_input_color) if self.user_input_color else dict()
-            self.console.print(inp, **style)
+            self.console.print(Text(inp), **style)
 
         prefix = "####"
         if inp:
@@ -298,18 +354,19 @@ class InputOutput:
         self.num_user_asks += 1
 
         if self.yes is True:
-            res = "yes"
+            res = "y"
         elif self.yes is False:
-            res = "no"
+            res = "n"
         else:
             res = prompt(question + " ", default=default)
 
-        hist = f"{question.strip()} {res.strip()}"
+        res = res.lower().strip()
+        is_yes = res in ("y", "yes")
+
+        hist = f"{question.strip()} {'y' if is_yes else 'n'}"
         self.append_chat_history(hist, linebreak=True, blockquote=True)
 
-        if not res or not res.strip():
-            return
-        return res.strip().lower().startswith("y")
+        return is_yes
 
     def prompt_ask(self, question, default=None):
         self.num_user_asks += 1
@@ -346,7 +403,7 @@ class InputOutput:
         style = dict(style=self.tool_error_color) if self.tool_error_color else dict()
         self.console.print(message, **style)
 
-    def tool_output(self, *messages, log_only=False):
+    def tool_output(self, *messages, log_only=False, bold=False):
         if messages:
             hist = " ".join(messages)
             hist = f"{hist.strip()}"
@@ -354,8 +411,10 @@ class InputOutput:
 
         if not log_only:
             messages = list(map(Text, messages))
-            style = dict(style=self.tool_output_color) if self.tool_output_color else dict()
-            self.console.print(*messages, **style)
+            style = dict(color=self.tool_output_color) if self.tool_output_color else dict()
+            style["reverse"] = bold
+            style = RichStyle(**style)
+            self.console.print(*messages, style=style)
 
     def append_chat_history(self, text, linebreak=False, blockquote=False, strip=True):
         if blockquote:

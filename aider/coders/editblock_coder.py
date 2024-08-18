@@ -1,7 +1,11 @@
+import difflib
 import math
 import re
+import sys
 from difflib import SequenceMatcher
 from pathlib import Path
+
+from aider import utils
 
 from ..dump import dump  # noqa: F401
 from .base_coder import Coder
@@ -9,11 +13,9 @@ from .editblock_prompts import EditBlockPrompts
 
 
 class EditBlockCoder(Coder):
+    """A coder that uses search/replace blocks for code modifications."""
     edit_format = "diff"
-
-    def __init__(self, *args, **kwargs):
-        self.gpt_prompts = EditBlockPrompts()
-        super().__init__(*args, **kwargs)
+    gpt_prompts = EditBlockPrompts()
 
     def get_edits(self):
         content = self.partial_response_content
@@ -74,7 +76,7 @@ class EditBlockCoder(Coder):
 
 """
 
-            if updated in content:
+            if updated in content and updated:
                 res += f"""Are you sure you need this SEARCH/REPLACE block?
 The REPLACE lines are already in {path}!
 
@@ -414,16 +416,8 @@ def find_original_update_blocks(content, fence=DEFAULT_FENCE):
 
             processed.append(cur)  # original_marker
 
-            filename = strip_filename(processed[-2].splitlines()[-1], fence)
-            try:
-                if not filename:
-                    filename = strip_filename(processed[-2].splitlines()[-2], fence)
-                if not filename:
-                    if current_filename:
-                        filename = current_filename
-                    else:
-                        raise ValueError(missing_filename_err.format(fence=fence))
-            except IndexError:
+            filename = find_filename(processed[-2].splitlines(), fence)
+            if not filename:
                 if current_filename:
                     filename = current_filename
                 else:
@@ -460,22 +454,33 @@ def find_original_update_blocks(content, fence=DEFAULT_FENCE):
         raise ValueError(f"{processed}\n^^^ Error parsing SEARCH/REPLACE block.")
 
 
-if __name__ == "__main__":
-    edit = """
-Here's the change:
+def find_filename(lines, fence):
+    """
+    Deepseek Coder v2 has been doing this:
 
-```text
-foo.txt
-<<<<<<< HEAD
-Two
-=======
-Tooooo
->>>>>>> updated
-```
 
-Hope you like it!
-"""
-    print(list(find_original_update_blocks(edit)))
+     ```python
+    word_count.py
+    ```
+    ```python
+    <<<<<<< SEARCH
+    ...
+
+    This is a more flexible search back for filenames.
+    """
+    # Go back through the 3 preceding lines
+    lines.reverse()
+    lines = lines[:3]
+
+    for line in lines:
+        # If we find a filename, done
+        filename = strip_filename(line, fence)
+        if filename:
+            return filename
+
+        # Only continue as long as we keep seeing fences
+        if not line.startswith(fence[0]):
+            return
 
 
 def find_similar_lines(search_lines, content_lines, threshold=0.6):
@@ -505,3 +510,32 @@ def find_similar_lines(search_lines, content_lines, threshold=0.6):
 
     best = content_lines[best_match_i:best_match_end]
     return "\n".join(best)
+
+
+def main():
+    history_md = Path(sys.argv[1]).read_text()
+    if not history_md:
+        return
+
+    messages = utils.split_chat_history_markdown(history_md)
+
+    for msg in messages:
+        msg = msg["content"]
+        edits = list(find_original_update_blocks(msg))
+
+        for fname, before, after in edits:
+            # Compute diff
+            diff = difflib.unified_diff(
+                before.splitlines(keepends=True),
+                after.splitlines(keepends=True),
+                fromfile="before",
+                tofile="after",
+            )
+            diff = "".join(diff)
+            dump(before)
+            dump(after)
+            dump(diff)
+
+
+if __name__ == "__main__":
+    main()

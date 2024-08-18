@@ -17,9 +17,10 @@ from aider.scrape import Scraper
 class CaptureIO(InputOutput):
     lines = []
 
-    def tool_output(self, msg):
-        self.lines.append(msg)
-        super().tool_output(msg)
+    def tool_output(self, msg, log_only=False):
+        if not log_only:
+            self.lines.append(msg)
+        super().tool_output(msg, log_only=log_only)
 
     def tool_error(self, msg):
         self.lines.append(msg)
@@ -110,9 +111,6 @@ class GUI:
         show_undo = False
         res = ""
         if commit_hash:
-            prefix = "aider: "
-            if commit_message.startswith(prefix):
-                commit_message = commit_message[len(prefix) :]
             res += f"Commit `{commit_hash}`: {commit_message}  \n"
             if commit_hash == self.coder.last_aider_commit_hash:
                 show_undo = True
@@ -483,10 +481,6 @@ class GUI:
 
         if not self.state.scraper:
             self.scraper = Scraper(print_error=self.info)
-
-        instructions = self.scraper.get_playwright_instructions()
-        if instructions:
-            self.info(instructions)
 
         content = self.scraper.scrape(url) or ""
         if content.strip():
